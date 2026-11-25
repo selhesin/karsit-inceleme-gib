@@ -13,6 +13,9 @@ st.set_page_config(
     layout="wide",
 )
 
+if "uploader_key" not in st.session_state:
+    st.session_state["uploader_key"] = 0
+
 GIB_COLUMNS = [
     "Faturanın Tarihi",
     "Faturanın Serisi",
@@ -150,7 +153,21 @@ def gib_excel_olustur(df_faturalar: pd.DataFrame, tutar_secimi: str, aciklama_ya
     return buf.getvalue()
 
 
-st.title("🧾 191 İndirilecek KDV Karşıt İnceleme & GİB Excel Dönüştürücü")
+col_baslik, col_yenile, col_sil = st.columns([6, 1, 1])
+with col_baslik:
+    st.title("🧾 191 İndirilecek KDV Karşıt İnceleme & GİB Dönüştürücü")
+with col_yenile:
+    st.write("")
+    if st.button("🔄 Yenile", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+with col_sil:
+    st.write("")
+    if st.button("🗑️ Sil", use_container_width=True):
+        st.session_state["uploader_key"] += 1
+        st.cache_data.clear()
+        st.rerun()
+
 st.caption("Ay bazında KDV %80 kümülatif pay ve İlk N alış parametresiyle firmaları ayrıştırır, faturalarını ayırır ve GİB 'Veriler' şablonuna çevirir.")
 
 with st.sidebar:
@@ -177,6 +194,7 @@ with st.sidebar:
 yuklenen_excel = st.file_uploader(
     "191 İndirilecek KDV Listesi Excel Dosyasını Yükleyin (.xlsx)",
     type=["xlsx", "xls"],
+    key=f"kdv_uploader_{st.session_state['uploader_key']}",
 )
 
 if not yuklenen_excel:
