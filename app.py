@@ -74,7 +74,20 @@ def guvenli_sayfa_adi(ad: str, kullanilanlar: set) -> str:
 
 
 def kdv_listesi_oku(file_obj) -> pd.DataFrame:
-    xl = pd.ExcelFile(file_obj)
+    file_bytes = file_obj.getvalue()
+    dosya_adi = getattr(file_obj, "name", "").lower()
+
+    if dosya_adi.endswith(".xls"):
+        try:
+            xl = pd.ExcelFile(io.BytesIO(file_bytes), engine="calamine")
+        except Exception:
+            xl = pd.ExcelFile(io.BytesIO(file_bytes), engine="xlrd")
+    else:
+        try:
+            xl = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+        except Exception:
+            xl = pd.ExcelFile(io.BytesIO(file_bytes), engine="calamine")
+
     hedef_sayfa = xl.sheet_names[0]
     for sh in xl.sheet_names:
         if "indirilecek" in sh.lower() or "kdv" in sh.lower():
