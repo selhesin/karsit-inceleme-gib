@@ -1,7 +1,5 @@
 import io
-import os
 import re
-import zipfile
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
@@ -34,9 +32,17 @@ def tl_str(val: float) -> str:
     return f"{val:,.2f} ₺".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def temiz_dosya_adi(metin: str) -> str:
-    temiz = re.sub(r'[\\/*?:"<>|]+', "_", str(metin)).strip()
-    return temiz[:45] if temiz else "Firma"
+def guvenli_sayfa_adi(ad: str, kullanilanlar: set) -> str:
+    temiz = re.sub(r'[\\/?*\[\]:]+', " ", str(ad)).strip()
+    temiz = re.sub(r"\s+", " ", temiz)[:31].strip() or "Firma"
+    aday = temiz
+    sayac = 2
+    while aday in kullanilanlar:
+        ek = f" ({sayac})"
+        aday = f"{temiz[: 31 - len(ek)]}{ek}"
+        sayac += 1
+    kullanilanlar.add(aday)
+    return aday
 
 
 def kdv_listesi_oku(file_obj) -> pd.DataFrame:
@@ -90,11 +96,7 @@ def kdv_listesi_oku(file_obj) -> pd.DataFrame:
     return df
 
 
-def gib_excel_olustur(df_faturalar: pd.DataFrame, tutar_secimi: str, aciklama_yaz: bool) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Veriler"
-
+def sayfa_doldur_gib(ws, df_faturalar: pd.DataFrame, tutar_secimi: str, aciklama_yaz: bool):
     hdr_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     hdr_fill = PatternFill("solid", fgColor="1E293B")
     body_font = Font(name="Calibri", size=11, color="000000")
@@ -147,6 +149,32 @@ def gib_excel_olustur(df_faturalar: pd.DataFrame, tutar_secimi: str, aciklama_ya
     for i, w in enumerate(genislikler, start=1):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
 
+
+def firma_sayfali_excel_olustur(
+    firma_kayitlari: list[tuple[str, pd.DataFrame]],
+    tutar_secimi: str,
+    aciklama_yaz: bool,
+) -> bytes:
+    wb = Workbook()
+    kullanilan_isimler = set()
+    ilk_sayfa = True
+
+    for etiket, f_df in firma_kayitlari:
+        if f_df.empty:
+            continue
+        sayfa_adi = guvenli_sayfa_adi(etiket, kullanilan_isimler)
+        if ilk_sayfa:
+            ws = wb.active
+            ws.title = sayfa_adi
+            ilk_sayfa = False
+        else:
+            ws = wb.create_sheet(title=sayfa_adi)
+        sayfa_doldur_gib(ws, f_df, tutar_secimi, aciklama_yaz)
+
+    if ilk_sayfa:
+        ws = wb.active
+        ws.title = "Bos"
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -168,7 +196,7 @@ with col_sil:
         st.cache_data.clear()
         st.rerun()
 
-st.caption("Ay bazında KDV %80 kümülatif pay ve İlk N alış parametresiyle firmaları ayrıştırır, faturalarını ayırır ve GİB 'Veriler' şablonuna çevirir.")
+st.caption("Seçilen dönemdeki tüm firmaları KDV tutarları ve indirim/kapsama yüzdeleriyle listeler; tek Excel'de firma bazlı sayfalar üretir.")
 
 with st.sidebar:
     st.header("⚙️ Karşıt İnceleme Filtreleri")
@@ -204,110 +232,154 @@ if not yuklenen_excel:
 df_tum = kdv_listesi_oku(yuklenen_excel)
 ay_listesi = sorted(df_tum["Ay"].unique())
 
-secili_ay = st.selectbox("📅 Dönem (Ay) Seçin", ["TÜM DÖNEM"] + ay_listesi, index=1 if ay_listesi else 0)
-df_ay = df_tum if secili_ay == "TÜM DÖNEM" else df_tum[df_tum["Ay"] == secili_ay].copy()
+secili_ay = st.selectbox(
+    "📅 Dönem (Ay) Seçin",
+    ["TÜM AYLAR (AY AY SAYFA)", "TÜM DÖNEM (TEK TOPLAM)"] + ay_listesi,
+    index=0,
+)
 
-toplam_kdv = df_ay["KDV"].sum()
-firma_tablosu = (
-    df_ay.groupby(["VKN", "Unvan"], as_index=False)
-    .agg(
-        Fatura_Adedi=("SiraNo", "count"),
-        KDV_Haric=("Matrah", "sum"),
-        KDV_Tutari=("KDV", "sum"),
-        KDV_Dahil=("KDV_Dahil_Tutar", "sum"),
+
+def firma_ozet_hesapla(df_parca: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+    tot_kdv = float(df_parca["KDV"].sum())
+    ozet = (
+        df_parca.groupby(["VKN", "Unvan"], as_index=False)
+        .agg(
+            Fatura_Adedi=("SiraNo", "count"),
+            KDV_Haric=("Matrah", "sum"),
+            KDV_Tutari=("KDV", "sum"),
+            KDV_Dahil=("KDV_Dahil_Tutar", "sum"),
+        )
+        .sort_values("KDV_Tutari", ascending=False)
+        .reset_index(drop=True)
     )
-    .sort_values("KDV_Tutari", ascending=False)
-    .reset_index(drop=True)
-)
+    ozet["KDV_Payi_%"] = (ozet["KDV_Tutari"] / tot_kdv * 100) if tot_kdv > 0 else 0.0
+    ozet["Kumulatif_%"] = ozet["KDV_Payi_%"].cumsum()
 
-firma_tablosu["KDV_Payi_%"] = (firma_tablosu["KDV_Tutari"] / toplam_kdv * 100) if toplam_kdv > 0 else 0.0
-firma_tablosu["Kumulatif_%"] = firma_tablosu["KDV_Payi_%"].cumsum()
+    esik_i = ozet[ozet["Kumulatif_%"] >= kdv_hedef_pct].index.min()
+    n_esik = int(esik_i + 1) if pd.notna(esik_i) else len(ozet)
 
-esik_idx = firma_tablosu[firma_tablosu["Kumulatif_%"] >= kdv_hedef_pct].index.min()
-n_kdv_esik = int(esik_idx + 1) if pd.notna(esik_idx) else len(firma_tablosu)
+    if kural_tipi.startswith("%80 KDV'ye"):
+        sec_n = min(n_esik, int(ilk_n_firma))
+    else:
+        sec_n = min(len(ozet), max(n_esik, int(ilk_n_firma)))
 
-if kural_tipi.startswith("%80 KDV'ye"):
-    sec_adet = min(n_kdv_esik, int(ilk_n_firma))
-else:
-    sec_adet = min(len(firma_tablosu), max(n_kdv_esik, int(ilk_n_firma)))
+    ozet["Secili"] = ozet.index < sec_n
+    return ozet, tot_kdv
 
-firma_tablosu["Secili"] = firma_tablosu.index < sec_adet
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Dönem Fatura Sayısı", f"{len(df_ay):,}")
-c2.metric("Dönem Toplam KDV", tl_str(toplam_kdv))
-c3.metric("Ayrıştırılan Firma", f"{sec_adet} / {len(firma_tablosu)}")
-c4.metric("Ayrıştırılan KDV Payı", f"%{firma_tablosu.loc[firma_tablosu['Secili'], 'KDV_Payi_%'].sum():.1f}")
+def tum_firmalari_liste_goster(ozet_df: pd.DataFrame, toplam_kdv: float, secili_kdv: float):
+    indirim_orani = (secili_kdv / toplam_kdv * 100) if toplam_kdv > 0 else 0.0
+    st.markdown(
+        f"**İndirim / KDV Kapsama Özeti:** Seçilen firmaların toplam KDV'si **{tl_str(secili_kdv)}** olup, "
+        f"toplam **{tl_str(toplam_kdv)}** tutarındaki 191 İndirilecek KDV'nin **%{indirim_orani:.2f}**'sini kapsamaktadır."
+    )
+    with st.expander(f"📋 Tüm Firmalar Listesi ({len(ozet_df)} Firma — Toplam KDV ve Payları)", expanded=True):
+        for idx, r in ozet_df.iterrows():
+            rozet = "✅ Seçili" if r["Secili"] else "⬜ Hariç"
+            st.markdown(
+                f"{idx + 1}. **{r['Unvan']}** (`VKN: {r['VKN']}`) — "
+                f"Toplam KDV: **{tl_str(r['KDV_Tutari'])}** "
+                f"(Pay: **%{r['KDV_Payi_%']:.2f}** | Kümülatif: **%{r['Kumulatif_%']:.2f}** | {r['Fatura_Adedi']} fatura) — {rozet}"
+            )
 
-st.subheader("1️⃣ Karşıt İnceleme Kapsamındaki Firmalar")
-onay_tablosu = st.data_editor(
-    firma_tablosu,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Secili": st.column_config.CheckboxColumn("Seç", default=True),
-        "KDV_Haric": st.column_config.NumberColumn("KDV Hariç (₺)", format="%.2f"),
-        "KDV_Tutari": st.column_config.NumberColumn("KDV (₺)", format="%.2f"),
-        "KDV_Dahil": st.column_config.NumberColumn("KDV Dahil (₺)", format="%.2f"),
-        "KDV_Payi_%": st.column_config.NumberColumn("KDV Payı (%)", format="%.2f%%"),
-        "Kumulatif_%": st.column_config.NumberColumn("Kümülatif (%)", format="%.2f%%"),
-    },
-    disabled=["VKN", "Unvan", "Fatura_Adedi", "KDV_Haric", "KDV_Tutari", "KDV_Dahil", "KDV_Payi_%", "Kumulatif_%"],
-)
 
-secili_firmalar = onay_tablosu[onay_tablosu["Secili"]].copy()
-df_secili_faturalar = df_ay[df_ay["VKN"].isin(secili_firmalar["VKN"])].sort_values(["Unvan", "Tarih_dt"]).copy()
+if secili_ay == "TÜM AYLAR (AY AY SAYFA)":
+    tum_ozet_list = []
+    sayfa_paketleri = []
+    for ay_kodu in ay_listesi:
+        df_m = df_tum[df_tum["Ay"] == ay_kodu].copy()
+        oz_m, _ = firma_ozet_hesapla(df_m)
+        oz_m.insert(0, "Ay", ay_kodu)
+        tum_ozet_list.append(oz_m)
 
-st.subheader("2️⃣ Ayrıştırılan Faturalar & GİB 'Veriler' Çıktısı")
-if df_secili_faturalar.empty:
-    st.warning("En az bir firma seçili olmalıdır.")
-    st.stop()
+        for _, f_r in oz_m[oz_m["Secili"]].iterrows():
+            f_fat = df_m[df_m["VKN"] == f_r["VKN"]].sort_values("Tarih_dt")
+            sayfa_paketleri.append((f"{ay_kodu} {f_r['Unvan']}", f_fat))
 
-st.dataframe(
-    pd.DataFrame(
-        {
-            "Satıcı Ünvanı": df_secili_faturalar["Unvan"],
-            "Faturanın Tarihi": df_secili_faturalar["Tarih_dt"].dt.strftime("%d.%m.%Y"),
-            "Faturanın Serisi": df_secili_faturalar["Seri"],
-            "Faturanın Numarası": df_secili_faturalar["SiraNo"],
-            "Faturanın Tutarı (TL)": (
-                df_secili_faturalar["KDV_Dahil_Tutar"]
-                if tutar_secimi.startswith("KDV Dahil")
-                else df_secili_faturalar["Matrah"]
-            ).round(2),
-            "K.D.V(TL)": df_secili_faturalar["KDV"].round(2),
-            "Açıklama": df_secili_faturalar["Cins"] if aciklama_yaz else "",
-        }
-    ),
-    use_container_width=True,
-    hide_index=True,
-)
+    birlesik_ozet = pd.concat(tum_ozet_list, ignore_index=True) if tum_ozet_list else pd.DataFrame()
+    toplam_kdv_tum = float(df_tum["KDV"].sum())
+    secili_kdv_tum = float(birlesik_ozet.loc[birlesik_ozet["Secili"], "KDV_Tutari"].sum()) if not birlesik_ozet.empty else 0.0
+    indirim_pct_tum = (secili_kdv_tum / toplam_kdv_tum * 100) if toplam_kdv_tum > 0 else 0.0
 
-zip_buf = io.BytesIO()
-with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-    for sira, (_, f_row) in enumerate(secili_firmalar.iterrows(), start=1):
-        f_df = df_secili_faturalar[df_secili_faturalar["VKN"] == f_row["VKN"]]
-        xl_data = gib_excel_olustur(f_df, tutar_secimi, aciklama_yaz)
-        ad = f"1.{sira}-{temiz_dosya_adi(f_row['Unvan'])}_{secili_ay}.xlsx"
-        zf.writestr(ad, xl_data)
-zip_buf.seek(0)
+    # Tüm firmalar bazında genel KDV toplamı ve payları
+    genel_firmalar = (
+        df_tum.groupby(["VKN", "Unvan"], as_index=False)
+        .agg(Fatura_Adedi=("SiraNo", "count"), KDV_Tutari=("KDV", "sum"))
+        .sort_values("KDV_Tutari", ascending=False)
+        .reset_index(drop=True)
+    )
+    genel_firmalar["KDV_Payi_%"] = (genel_firmalar["KDV_Tutari"] / toplam_kdv_tum * 100) if toplam_kdv_tum > 0 else 0.0
+    genel_firmalar["Kumulatif_%"] = genel_firmalar["KDV_Payi_%"].cumsum()
+    secili_vkn_set = set(birlesik_ozet.loc[birlesik_ozet["Secili"], "VKN"]) if not birlesik_ozet.empty else set()
+    genel_firmalar["Secili"] = genel_firmalar["VKN"].isin(secili_vkn_set)
 
-col_b1, col_b2 = st.columns(2)
-with col_b1:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Toplam 191 KDV", tl_str(toplam_kdv_tum))
+    c2.metric("Seçili Firmalar KDV", tl_str(secili_kdv_tum))
+    c3.metric("İndirim / KDV Oranı", f"%{indirim_pct_tum:.2f}")
+    c4.metric("Oluşacak Firma Sayfası", f"{len(sayfa_paketleri)} Sayfa")
+
+    st.subheader("1️⃣ Ön İzleme — Tüm Firmalar ve Toplam KDV Listesi")
+    tum_firmalari_liste_goster(genel_firmalar, toplam_kdv_tum, secili_kdv_tum)
+
+    excel_cikti = firma_sayfali_excel_olustur(sayfa_paketleri, tutar_secimi, aciklama_yaz)
     st.download_button(
-        label=f"📦 Firma Bazlı GİB Excel'leri İndir (.ZIP — {len(secili_firmalar)} Firma)",
-        data=zip_buf.getvalue(),
-        file_name=f"GIB_Karsit_Inceleme_{secili_ay}.zip",
-        mime="application/zip",
+        label=f"📥 Tüm Karşıt İnceleme Firmalarını Tek Excel'de İndir ({len(sayfa_paketleri)} Ayrı Sayfa)",
+        data=excel_cikti,
+        file_name="Karsit_Inceleme_Tum_Aylar_Firmalar.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True,
     )
 
-with col_b2:
+else:
+    df_ay = df_tum if secili_ay == "TÜM DÖNEM (TEK TOPLAM)" else df_tum[df_tum["Ay"] == secili_ay].copy()
+    firma_tablosu, toplam_kdv = firma_ozet_hesapla(df_ay)
+
+    st.subheader("1️⃣ Karşıt İnceleme Kapsamındaki Firmalar (İstediğini Seç/Kaldır)")
+    onay_tablosu = st.data_editor(
+        firma_tablosu,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Secili": st.column_config.CheckboxColumn("Seç", default=True),
+            "KDV_Haric": st.column_config.NumberColumn("KDV Hariç (₺)", format="%.2f"),
+            "KDV_Tutari": st.column_config.NumberColumn("KDV (₺)", format="%.2f"),
+            "KDV_Dahil": st.column_config.NumberColumn("KDV Dahil (₺)", format="%.2f"),
+            "KDV_Payi_%": st.column_config.NumberColumn("KDV Payı (%)", format="%.2f%%"),
+            "Kumulatif_%": st.column_config.NumberColumn("Kümülatif (%)", format="%.2f%%"),
+        },
+        disabled=["VKN", "Unvan", "Fatura_Adedi", "KDV_Haric", "KDV_Tutari", "KDV_Dahil", "KDV_Payi_%", "Kumulatif_%"],
+    )
+
+    secili_firmalar = onay_tablosu[onay_tablosu["Secili"]].copy()
+    secili_kdv = float(secili_firmalar["KDV_Tutari"].sum()) if not secili_firmalar.empty else 0.0
+    indirim_pct = (secili_kdv / toplam_kdv * 100) if toplam_kdv > 0 else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Dönem Toplam KDV", tl_str(toplam_kdv))
+    c2.metric("Seçili Firmalar KDV", tl_str(secili_kdv))
+    c3.metric("İndirim / KDV Oranı", f"%{indirim_pct:.2f}")
+    c4.metric("Seçili Firma / Sayfa", f"{len(secili_firmalar)} / {len(onay_tablosu)}")
+
+    st.subheader("2️⃣ Ön İzleme — Tüm Firmalar Listesi ve İndirim Oranı")
+    tum_firmalari_liste_goster(onay_tablosu, toplam_kdv, secili_kdv)
+
+    sayfa_paketleri = []
+    for _, f_r in secili_firmalar.iterrows():
+        f_fat = df_ay[df_ay["VKN"] == f_r["VKN"]].sort_values("Tarih_dt")
+        sayfa_paketleri.append((f_r["Unvan"], f_fat))
+
+    if not sayfa_paketleri:
+        st.warning("En az bir firma seçili olmalıdır.")
+        st.stop()
+
+    excel_cikti = firma_sayfali_excel_olustur(sayfa_paketleri, tutar_secimi, aciklama_yaz)
     st.download_button(
-        label="📥 Seçili Tüm Faturaları Tek GİB Excel İndir (.xlsx)",
-        data=gib_excel_olustur(df_secili_faturalar, tutar_secimi, aciklama_yaz),
-        file_name=f"GIB_Veriler_Toplu_{secili_ay}.xlsx",
+        label=f"📥 Seçili {len(sayfa_paketleri)} Firmayı Tek Excel'de (Ayrı Sayfalarla) İndir",
+        data=excel_cikti,
+        file_name=f"Karsit_Inceleme_Firmalar_{secili_ay}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
         use_container_width=True,
     )
