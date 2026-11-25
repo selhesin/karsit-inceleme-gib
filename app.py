@@ -5,14 +5,42 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+APP_SIFRE = "1903"
+
 st.set_page_config(
     page_title="191 KDV Karşıt İnceleme & GİB Dönüştürücü",
     page_icon="🧾",
     layout="wide",
 )
 
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
+
+
+def sifre_ekrani():
+    st.markdown("## 🔒 Karşıt İnceleme Portalı — Giriş")
+    st.caption("Uygulamaya erişmek için şifreyi girin.")
+
+    col_form, _ = st.columns([1.2, 2.8])
+    with col_form:
+        with st.form("login_form", clear_on_submit=False):
+            girilen_sifre = st.text_input("Şifre", type="password", placeholder="Şifreyi girin...")
+            giris_btn = st.form_submit_button("Giriş Yap", type="primary", use_container_width=True)
+
+        if giris_btn:
+            if girilen_sifre == APP_SIFRE:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Hatalı şifre. Lütfen tekrar deneyin.")
+
+
+if not st.session_state["authenticated"]:
+    sifre_ekrani()
+    st.stop()
 
 GIB_COLUMNS = [
     "Faturanın Tarihi",
@@ -181,7 +209,7 @@ def firma_sayfali_excel_olustur(
     return buf.getvalue()
 
 
-col_baslik, col_yenile, col_sil = st.columns([6, 1, 1])
+col_baslik, col_yenile, col_sil, col_cikis = st.columns([5.2, 1, 1, 1.2])
 with col_baslik:
     st.title("🧾 191 İndirilecek KDV Karşıt İnceleme & GİB Dönüştürücü")
 with col_yenile:
@@ -194,6 +222,11 @@ with col_sil:
     if st.button("🗑️ Sil", use_container_width=True):
         st.session_state["uploader_key"] += 1
         st.cache_data.clear()
+        st.rerun()
+with col_cikis:
+    st.write("")
+    if st.button("🔐 Kilitle", use_container_width=True):
+        st.session_state["authenticated"] = False
         st.rerun()
 
 st.caption("Seçilen dönemdeki tüm firmaları KDV tutarları ve indirim/kapsama yüzdeleriyle listeler; tek Excel'de firma bazlı sayfalar üretir.")
@@ -301,7 +334,6 @@ if secili_ay == "TÜM AYLAR (AY AY SAYFA)":
     secili_kdv_tum = float(birlesik_ozet.loc[birlesik_ozet["Secili"], "KDV_Tutari"].sum()) if not birlesik_ozet.empty else 0.0
     indirim_pct_tum = (secili_kdv_tum / toplam_kdv_tum * 100) if toplam_kdv_tum > 0 else 0.0
 
-    # Tüm firmalar bazında genel KDV toplamı ve payları
     genel_firmalar = (
         df_tum.groupby(["VKN", "Unvan"], as_index=False)
         .agg(Fatura_Adedi=("SiraNo", "count"), KDV_Tutari=("KDV", "sum"))
